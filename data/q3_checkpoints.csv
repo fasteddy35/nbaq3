@@ -1,3 +1,4 @@
 game_date,espn_id,away,home,tipoff_utc,captured_utc,capture_period,capture_clock,away_score,home_score,margin,q3_poss_to_6,q3_pace_to_6,score_at_6,margin_at_6,odds_status,odds_updated_utc,spread_home,spread_home_price,spread_away,spread_away_price,total,over_price,under_price,odds_credits_left
 2026-10-22,401909093,CLE,PHI,2026-10-22T23:00Z,2026-10-23T05:07:33Z,F,,106,114,8,32,5.33,80-68,12,missed,,,,,,,,,
 2026-10-22,401909094,DEN,OKC,2026-10-23T01:30Z,2026-10-23T05:07:33Z,F,,84,96,12,21,3.5,60-55,5,missed,,,,,,,,,
+2026-10-23,401909848,CHI,MIL,2026-10-23T20:00Z,2026-10-23T21:42:49Z,3,6:00,80,83,3,26,4.33,82-83,1,ok,2026-10-23T21:42:47Z,-2.5,-111,2.5,-113,247.5,-110,-114,19560
