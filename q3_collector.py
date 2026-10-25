@@ -1,8 +1,9 @@
 """Q3 6:00 checkpoint collector.
 
 The first time a game's 3rd-quarter clock reaches 6:00, this records the live
-score, Pinnacle's live spread and total (one Odds API pull per game), and
-pace_checkpoint.py's Q3 possessions/pace from 12:00 down to 6:00.
+score, Pinnacle's live spread and total (up to 5 Odds API attempts per game),
+and pace_checkpoint.py's Q3 possessions/pace from 12:00 down to 6:00. Once the
+game ends, the row also gets the score at the end of Q4, the final score and OT.
 
 Rows go to data/q3_checkpoints.csv. That file is also the record of which
 games are done, so a game is never pulled twice, even across runs.
@@ -11,7 +12,8 @@ import csv
 import os
 import subprocess
 import time
-from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
@@ -19,6 +21,7 @@ import requests
 # ── CONFIG ──────────────────────────────────────────────────────
 CHECKPOINT_MINUTE = 6.0                          # Q3 clock to snapshot at (6:00 left)
 ODDS_CUTOFF_MIN   = 4.0                          # first seen below 4:00 -> too late, skip odds
+ODDS_RETRY_DELAYS = [5, 10, 20, 20]              # seconds to wait before odds attempts 2-5
 POLL_SECONDS      = 15
 LOOKAHEAD         = timedelta(minutes=90)        # stay running if a game tips within this
 MAX_RUNTIME       = timedelta(hours=5, minutes=40)  # GitHub kills jobs at 6h
@@ -38,6 +41,8 @@ FIELDS = [
     'odds_status', 'odds_updated_utc',
     'spread_home', 'spread_home_price', 'spread_away', 'spread_away_price',
     'total', 'over_price', 'under_price', 'odds_credits_left',
+    'odds_attempts', 'odds_clock',
+    'score_end_q4', 'ot', 'final_score',
 ]
 
 
@@ -59,6 +64,8 @@ def parse_event(event, game_date):
         'home_name':  teams['home']['team']['displayName'],
         'away_score': int(teams['away'].get('score') or 0),
         'home_score': int(teams['home'].get('score') or 0),
+        'away_lines': [int(q.get('value') or 0) for q in teams['away'].get('linescores', [])],
+        'home_lines': [int(q.get('value') or 0) for q in teams['home'].get('linescores', [])],
         'state':      status['type']['state'],        # pre / in / post
         'status':     status['type']['name'],
         'period':     status.get('period', 0),
@@ -68,16 +75,17 @@ def parse_event(event, game_date):
     }
 
 
+def get_scoreboard(day):
+    """All games on one ET date, keyed by ESPN id."""
+    resp = requests.get(f'{ESPN_API}/scoreboard', params={'dates': f'{day:%Y%m%d}'}, timeout=10)
+    resp.raise_for_status()
+    return {e['id']: parse_event(e, day.isoformat()) for e in resp.json().get('events', [])}
+
+
 def get_games():
     """Yesterday's and today's games (ET), so games running past midnight stay visible."""
     today = datetime.now(ET).date()
-    games = {}
-    for day in (today - timedelta(days=1), today):
-        resp = requests.get(f'{ESPN_API}/scoreboard', params={'dates': f'{day:%Y%m%d}'}, timeout=10)
-        resp.raise_for_status()
-        for event in resp.json().get('events', []):
-            games[event['id']] = parse_event(event, day.isoformat())
-    return games
+    return {**get_scoreboard(today - timedelta(days=1)), **get_scoreboard(today)}
 
 
 def get_plays(game_id):
@@ -184,33 +192,110 @@ def pull_odds(game):
         return {'odds_status': f'error: {e}'[:120]}
 
 
+def game_clock(game):
+    """The game clock right now: '5:32' while in Q3, otherwise e.g. 'Q4 11:48'."""
+    try:
+        now = get_scoreboard(date.fromisoformat(game['game_date']))[game['id']]
+    except Exception:
+        return ''
+    return now['clock_str'] if now['period'] == 3 else f"Q{now['period']} {now['clock_str']}"
+
+
+def pull_odds_with_retries(game):
+    """Runs in a worker thread, so retry waits don't hold up other games."""
+    for attempt in range(1, len(ODDS_RETRY_DELAYS) + 2):
+        if attempt > 1:
+            time.sleep(ODDS_RETRY_DELAYS[attempt - 2])
+        odds = pull_odds(game)
+        if odds['odds_status'] in ('ok', 'no_key'):
+            break
+        log(f"{game['away']} @ {game['home']}: odds attempt {attempt} failed ({odds['odds_status']})")
+    odds['odds_attempts'] = attempt
+    if odds['odds_status'] == 'ok':
+        odds['odds_clock'] = game_clock(game)
+    log(f"{game['away']} @ {game['home']}: odds {odds['odds_status']} on attempt {attempt}"
+        f"{' at ' + odds['odds_clock'] if odds.get('odds_clock') else ''}")
+    return odds
+
+
 # ── STORAGE ─────────────────────────────────────────────────────
 
-def load_recorded():
+def read_rows():
+    """CSV -> {espn_id: row}. Columns added after a row was written come back blank."""
     if not os.path.exists(DATA_FILE):
-        return set()
+        return {}
     with open(DATA_FILE, newline='') as f:
-        return {row['espn_id'] for row in csv.DictReader(f)}
+        return {r['espn_id']: {k: r.get(k) or '' for k in FIELDS} for r in csv.DictReader(f)}
 
 
-def write_row(row):
+def write_rows(rows):
     os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
-    new_file = not os.path.exists(DATA_FILE)
-    with open(DATA_FILE, 'a', newline='') as f:
+    with open(DATA_FILE, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=FIELDS)
-        if new_file:
-            writer.writeheader()
-        writer.writerow(row)
+        writer.writeheader()
+        writer.writerows(rows.values())
 
 
-def commit(message):
-    """Push each new row right away so a crashed or later run never re-pulls that game."""
+def git(*args, check=True):
+    return subprocess.run(['git', *args], check=check, capture_output=True, text=True)
+
+
+def pull_latest():
+    """Reset to the remote branch tip.
+
+    The checkout is the commit that triggered the run, which is hours old when the run sat
+    queued behind another one. Building on it made the CSV conflict on rebase, and every
+    push for the rest of that run was silently dropped.
+    """
     if os.environ.get('GIT_PUSH') != '1':
         return
-    subprocess.run(['git', 'add', DATA_FILE], check=True)
-    subprocess.run(['git', 'commit', '-q', '-m', message], check=True)
-    subprocess.run(['git', 'pull', '-q', '--rebase'], check=False)
-    subprocess.run(['git', 'push', '-q'], check=False)  # a failed push rides along with the next one
+    branch = git('rev-parse', '--abbrev-ref', 'HEAD').stdout.strip()
+    git('fetch', '-q', '--depth=1', 'origin', branch)
+    git('reset', '-q', '--hard', 'FETCH_HEAD')
+
+
+def commit(rows, message):
+    """Push each change right away so a crashed or later run never re-pulls that game."""
+    write_rows(rows)
+    if os.environ.get('GIT_PUSH') != '1':
+        return
+    for _ in range(3):
+        pull_latest()
+        for gid, row in read_rows().items():  # keep rows pushed since; ours win on the same game
+            rows.setdefault(gid, row)
+        write_rows(rows)
+        git('add', DATA_FILE)
+        if git('diff', '--cached', '--quiet', check=False).returncode == 0:
+            return
+        git('commit', '-q', '-m', message)
+        if git('push', '-q', 'origin', 'HEAD', check=False).returncode == 0:
+            return
+    log(f'push failed 3 times, will go out with the next save ({message})')
+
+
+def fill_finals(rows, games):
+    """Add Q4-end score, final score and OT to rows whose game has ended. Returns the ids filled."""
+    filled = []
+    for gid, row in rows.items():
+        game = games.get(gid)
+        if row['final_score'] or not game or game['state'] != 'post' or len(game['home_lines']) < 4:
+            continue
+        row['score_end_q4'] = f"{sum(game['away_lines'][:4])}-{sum(game['home_lines'][:4])}"
+        row['final_score']  = f"{game['away_score']}-{game['home_score']}"
+        row['ot']           = 'yes' if len(game['home_lines']) > 4 else 'no'
+        filled.append(gid)
+    return filled
+
+
+def backfill_finals(rows):
+    """Finals for rows older than get_games()' two-day window."""
+    games = {}
+    for day in {r['game_date'] for r in rows.values() if not r['final_score']}:
+        try:
+            games.update(get_scoreboard(date.fromisoformat(day)))
+        except Exception as e:
+            log(f'scoreboard fetch for {day} failed ({e})')
+    return fill_finals(rows, games)
 
 
 # ── MAIN LOOP ───────────────────────────────────────────────────
@@ -220,12 +305,12 @@ def past_checkpoint(game):
             or (game['period'] == 3 and game['clock'] <= CHECKPOINT_MINUTE * 60))
 
 
-def snapshot(game):
-    """Capture the moment: live score now, plus the single odds pull if still on time."""
+def snapshot(game, pool):
+    """Capture the moment: live score now, and start the odds pull if still on time."""
     on_time = game['state'] == 'in' and game['period'] == 3 and game['clock'] >= ODDS_CUTOFF_MIN * 60
-    odds    = pull_odds(game) if on_time else {'odds_status': 'missed'}
+    odds    = pool.submit(pull_odds_with_retries, game) if on_time else None
     log(f"{game['away']} @ {game['home']}: captured Q{game['period']} {game['clock_str']} "
-        f"{game['away_score']}-{game['home_score']}, odds {odds['odds_status']}")
+        f"{game['away_score']}-{game['home_score']}{'' if on_time else ', odds missed'}")
     return {
         'game_date':      game['game_date'],
         'espn_id':        game['id'],
@@ -238,12 +323,15 @@ def snapshot(game):
         'away_score':     game['away_score'],
         'home_score':     game['home_score'],
         'margin':         abs(game['home_score'] - game['away_score']),
-        **odds,
+        'odds':           odds,  # Future, or None when too late
     }
 
 
 def finalize(snap, game, force=False):
-    """Add pace once the play-by-play has caught up past 6:00 (ESPN's feed lags the clock)."""
+    """Add odds and pace once both are in (ESPN's play-by-play lags the clock)."""
+    future = snap['odds']
+    if future and not future.done() and not force:
+        return None
     try:
         plays = get_plays(snap['espn_id'])
     except Exception as e:
@@ -256,23 +344,36 @@ def finalize(snap, game, force=False):
         return None
     poss, pace, score = pace_at_checkpoint(plays)
     margin = abs(int(score.split('-')[0]) - int(score.split('-')[1])) if score != '--' else ''
-    return {**snap, 'q3_poss_to_6': poss, 'q3_pace_to_6': pace, 'score_at_6': score, 'margin_at_6': margin}
+    odds   = future.result() if future else {'odds_status': 'missed'}
+    snap   = {k: v for k, v in snap.items() if k != 'odds'}
+    return {**dict.fromkeys(FIELDS, ''), **snap, **odds,
+            'q3_poss_to_6': poss, 'q3_pace_to_6': pace, 'score_at_6': score, 'margin_at_6': margin}
 
 
 def watching(game, now):
     return game['state'] == 'in' or (game['state'] == 'pre' and game['tipoff'] - now <= LOOKAHEAD)
 
 
-def save(row):
-    write_row(row)
+def save(rows, row):
+    rows[row['espn_id']] = row
     log(f"{row['away']} @ {row['home']}: saved ({row['q3_poss_to_6']} poss, pace {row['q3_pace_to_6']})")
-    commit(f"Q3 checkpoint: {row['away']} @ {row['home']} {row['game_date']}")
+    commit(rows, f"Q3 checkpoint: {row['away']} @ {row['home']} {row['game_date']}")
+
+
+def save_finals(rows, filled):
+    if filled:
+        names = ', '.join(f"{rows[gid]['away']} @ {rows[gid]['home']}" for gid in filled)
+        log(f'finals: {names}')
+        commit(rows, f'Finals: {names}')
 
 
 def run():
-    started  = datetime.now(timezone.utc)
-    recorded = load_recorded()
-    pending  = {}
+    started = datetime.now(timezone.utc)
+    pull_latest()
+    rows    = read_rows()
+    pending = {}
+    pool    = ThreadPoolExecutor(max_workers=8)
+    save_finals(rows, backfill_finals(rows))
 
     while True:
         now = datetime.now(timezone.utc)
@@ -285,20 +386,23 @@ def run():
         if games is not None:
             for game in games.values():
                 gid = game['id']
-                if gid in recorded or gid in pending or game['status'] in SKIP_STATUSES:
+                if gid in rows or gid in pending or game['status'] in SKIP_STATUSES:
                     continue
                 if past_checkpoint(game):
-                    pending[gid] = snapshot(game)
+                    pending[gid] = snapshot(game, pool)
 
             for gid in list(pending):
                 row = finalize(pending[gid], games.get(gid))
                 if row:
-                    save(row)
-                    recorded.add(gid)
+                    save(rows, row)
                     del pending[gid]
 
+            save_finals(rows, fill_finals(rows, games))
+
+            # Keep running for games yet to reach 6:00 and for saved games still waiting on a final.
             waiting = [g for g in games.values()
-                       if g['id'] not in recorded and g['status'] not in SKIP_STATUSES and watching(g, now)]
+                       if g['status'] not in SKIP_STATUSES and watching(g, now)
+                       and not rows.get(g['id'], {}).get('final_score')]
             if not pending and not waiting:
                 log('Nothing live or tipping off soon. Exiting.')
                 break
@@ -308,10 +412,11 @@ def run():
             break
         time.sleep(POLL_SECONDS)
 
-    for gid, snap in pending.items():
+    for snap in pending.values():
         row = finalize(snap, None, force=True)
         if row:
-            save(row)
+            save(rows, row)
+    pool.shutdown(wait=False)
 
 
 if __name__ == '__main__':
