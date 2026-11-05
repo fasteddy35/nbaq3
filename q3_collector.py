@@ -1,7 +1,7 @@
 """Q3 6:00 checkpoint collector.
 
 The first time a game's 3rd-quarter clock reaches 6:00, this records the live
-score, Pinnacle's live spread and total (up to 5 Odds API attempts per game),
+score, Polymarket's main live spread and total (up to 5 attempts per game),
 and pace_checkpoint.py's Q3 possessions/pace from 12:00 down to 6:00. Once the
 game ends, the row also gets the score at the end of Q4, the final score and OT.
 
@@ -9,6 +9,7 @@ Rows go to data/q3_checkpoints.csv. That file is also the record of which
 games are done, so a game is never pulled twice, even across runs.
 """
 import csv
+import json
 import os
 import subprocess
 import time
@@ -28,8 +29,9 @@ MAX_RUNTIME       = timedelta(hours=5, minutes=40)  # GitHub kills jobs at 6h
 PBP_WAIT          = timedelta(minutes=10)        # max wait for play-by-play to pass 6:00
 DATA_FILE         = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'q3_checkpoints.csv')
 ESPN_API          = 'https://site.api.espn.com/apis/site/v2/sports/basketball/nba'
-ODDS_API          = 'https://api.the-odds-api.com/v4/sports/basketball_nba'
-ODDS_KEY          = os.environ.get('ODDS_API_KEY', '')
+GAMMA_API         = 'https://gamma-api.polymarket.com'
+CLOB_API          = 'https://clob.polymarket.com'
+MAX_BOOK_WIDTH    = 0.10                         # main line must have bid-ask within 10c if any do
 ET                = ZoneInfo('America/New_York')
 SKIP_STATUSES     = {'STATUS_POSTPONED', 'STATUS_CANCELED', 'STATUS_SUSPENDED'}
 # ────────────────────────────────────────────────────────────────
@@ -42,6 +44,7 @@ FIELDS = [
     'spread_home', 'spread_home_price', 'spread_away', 'spread_away_price',
     'total', 'over_price', 'under_price', 'odds_credits_left',
     'odds_attempts', 'odds_clock',
+    'odds_source', 'polymarket_slug', 'spread_home_mid', 'over_mid',
     'score_end_q4', 'ot', 'final_score',
 ]
 
@@ -146,48 +149,107 @@ def pbp_past_checkpoint(plays):
     return False
 
 
-# ── ODDS (Pinnacle via The Odds API) ────────────────────────────
+# ── ODDS (Polymarket: Gamma API finds the markets, CLOB order books give prices) ──
 
 def nickname(team_name):
-    return team_name.split()[-1].lower()  # 'LA Clippers' and 'Los Angeles Clippers' -> 'clippers'
+    return team_name.split()[-1].lower()  # 'LA Clippers' and 'Trail Blazers' -> 'clippers', 'blazers'
+
+
+def to_american(prob):
+    """Polymarket price (0-1) -> American odds, e.g. 0.524 -> -110, 0.40 -> +150."""
+    if prob is None or not 0 < prob < 1:
+        return ''
+    return round(-100 * prob / (1 - prob)) if prob >= 0.5 else round(100 * (1 - prob) / prob)
+
+
+def find_event(game):
+    """The Polymarket game event (with its markets) for this ESPN game, or None."""
+    tip   = game['tipoff']
+    resp  = requests.get(f'{GAMMA_API}/events', timeout=15, params={
+        'tag_slug': 'nba', 'closed': 'false', 'limit': 100,
+        'end_date_min': (tip - timedelta(hours=3)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'end_date_max': (tip + timedelta(hours=3)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+    })
+    resp.raise_for_status()
+    want = f"{nickname(game['away_name'])} vs. {nickname(game['home_name'])}"
+    for event in resp.json():
+        # Game events are titled 'Away vs. Home'; spin-offs like '... - Exact Margin' don't match.
+        title = ' vs. '.join(nickname(t) for t in event.get('title', '').split(' vs. '))
+        if title == want and any(m.get('sportsMarketType') == 'spreads' for m in event.get('markets', [])):
+            return event
+    return None
+
+
+def get_books(token_ids):
+    """Best bid/ask for each token from the live order book: {token: (bid, ask, ms_timestamp)}."""
+    resp = requests.post(f'{CLOB_API}/books', json=[{'token_id': t} for t in token_ids], timeout=15)
+    resp.raise_for_status()
+    books = {}
+    for b in resp.json():
+        bid = max((float(o['price']) for o in b.get('bids', [])), default=None)
+        ask = min((float(o['price']) for o in b.get('asks', [])), default=None)
+        books[b['asset_id']] = (bid, ask, int(b.get('timestamp') or 0))
+    return books
+
+
+def main_line(candidates):
+    """Polymarket lists a ladder of lines. The main line is the one priced closest to 50/50,
+    preferring books no wider than MAX_BOOK_WIDTH. Each candidate is (line, bid, ask, ts) for
+    the home/over side."""
+    two_sided = [c for c in candidates if c[1] is not None and c[2] is not None]
+    tight     = [c for c in two_sided if c[2] - c[1] <= MAX_BOOK_WIDTH] or two_sided
+    return min(tight, key=lambda c: abs((c[1] + c[2]) / 2 - 0.5), default=None)
 
 
 def pull_odds(game):
-    """One Odds API pull: Pinnacle spread + total for this game, right now."""
-    if not ODDS_KEY:
-        return {'odds_status': 'no_key'}
+    """One Polymarket pull: the main live spread and total for this game, right now."""
     try:
-        # The events list is free; only the odds call below uses credits (2: spreads + totals).
-        events = requests.get(f'{ODDS_API}/events', params={'apiKey': ODDS_KEY}, timeout=10)
-        events.raise_for_status()
-        want  = (nickname(game['away_name']), nickname(game['home_name']))
-        event = next((e for e in events.json()
-                      if (nickname(e['away_team']), nickname(e['home_team'])) == want), None)
+        event = find_event(game)
         if not event:
             return {'odds_status': 'no_event'}
 
-        resp = requests.get(f"{ODDS_API}/events/{event['id']}/odds", timeout=10, params={
-            'apiKey': ODDS_KEY, 'bookmakers': 'pinnacle',
-            'markets': 'spreads,totals', 'oddsFormat': 'american',
-        })
-        resp.raise_for_status()
-        row  = {'odds_credits_left': resp.headers.get('x-requests-remaining', '')}
-        book = next((b for b in resp.json().get('bookmakers', []) if b['key'] == 'pinnacle'), None)
-        if not book:
-            return {**row, 'odds_status': 'no_pinnacle'}
+        home    = nickname(game['home_name'])
+        markets = [m for m in event['markets']
+                   if m.get('sportsMarketType') in ('spreads', 'totals') and not m.get('closed')
+                   and m.get('line') is not None and m.get('clobTokenIds')]
+        tokens  = {m['id']: json.loads(m['clobTokenIds'])[0] for m in markets}  # outcome 0's token
+        books   = get_books(list(tokens.values())) if tokens else {}
 
-        updated = []
-        for market in book.get('markets', []):
-            updated.append(market.get('last_update', ''))
-            for o in market.get('outcomes', []):
-                if market['key'] == 'spreads':
-                    side = 'home' if o['name'] == event['home_team'] else 'away'
-                    row[f'spread_{side}']       = o.get('point')
-                    row[f'spread_{side}_price'] = o.get('price')
-                elif market['key'] == 'totals':
-                    row['total'] = o.get('point')
-                    row['over_price' if o['name'] == 'Over' else 'under_price'] = o.get('price')
-        return {**row, 'odds_status': 'ok', 'odds_updated_utc': max(updated, default='')}
+        spreads, totals = [], []
+        for m in markets:
+            bid, ask, ts = books.get(tokens[m['id']], (None, None, 0))
+            line = float(m['line'])
+            if m['sportsMarketType'] == 'totals':      # outcomes ['Over', 'Under']
+                totals.append((line, bid, ask, ts))
+            elif nickname(json.loads(m['outcomes'])[0]) == home:   # 'Spread: Home (-x)'
+                spreads.append((line, bid, ask, ts))
+            else:                                       # 'Spread: Away (-x)' -> home +x
+                spreads.append((-line, 1 - ask if ask is not None else None,
+                                1 - bid if bid is not None else None, ts))
+
+        row, stamps = {'polymarket_slug': event.get('slug', '')}, []
+        spread = main_line(spreads)
+        if spread:
+            line, bid, ask, ts = spread
+            stamps.append(ts)
+            row.update({
+                'spread_home': line,  'spread_home_price': to_american(ask),
+                'spread_away': -line, 'spread_away_price': to_american(1 - bid),
+                'spread_home_mid': round((bid + ask) / 2, 4),
+            })
+        total = main_line(totals)
+        if total:
+            line, bid, ask, ts = total
+            stamps.append(ts)
+            row.update({
+                'total': line, 'over_price': to_american(ask), 'under_price': to_american(1 - bid),
+                'over_mid': round((bid + ask) / 2, 4),
+            })
+        if not stamps:
+            return {**row, 'odds_status': 'no_lines'}
+        updated = datetime.fromtimestamp(max(stamps) / 1000, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        return {**row, 'odds_status': 'ok' if spread and total else 'partial',
+                'odds_source': 'polymarket', 'odds_updated_utc': updated}
     except Exception as e:
         return {'odds_status': f'error: {e}'[:120]}
 
@@ -207,7 +269,7 @@ def pull_odds_with_retries(game):
         if attempt > 1:
             time.sleep(ODDS_RETRY_DELAYS[attempt - 2])
         odds = pull_odds(game)
-        if odds['odds_status'] in ('ok', 'no_key'):
+        if odds['odds_status'] == 'ok':
             break
         log(f"{game['away']} @ {game['home']}: odds attempt {attempt} failed ({odds['odds_status']})")
     odds['odds_attempts'] = attempt
@@ -225,7 +287,11 @@ def read_rows():
     if not os.path.exists(DATA_FILE):
         return {}
     with open(DATA_FILE, newline='') as f:
-        return {r['espn_id']: {k: r.get(k) or '' for k in FIELDS} for r in csv.DictReader(f)}
+        rows = {r['espn_id']: {k: r.get(k) or '' for k in FIELDS} for r in csv.DictReader(f)}
+    for row in rows.values():  # rows from before the switch to Polymarket
+        if row['odds_status'] == 'ok' and not row['odds_source']:
+            row['odds_source'] = 'pinnacle'
+    return rows
 
 
 def write_rows(rows):
