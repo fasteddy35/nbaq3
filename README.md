@@ -3,7 +3,7 @@
 For every NBA game, the first time the 3rd-quarter clock hits **6:00**, this records:
 
 - the live score and margin
-- **Polymarket's main live spread and total** (with prices), with up to 5 attempts per game
+- **FanDuel's live spread and total** (with prices), via The Odds API, with up to 5 attempts per game
 - Q3 possessions and pace from 12:00 to 6:00, using the same rules as `pace_checkpoint.py`
 - once the game ends: the score at the end of Q4, the final score, and whether it went to OT
 
@@ -11,14 +11,14 @@ It runs on GitHub Actions and adds each game as a row in [`data/q3_checkpoints.c
 
 ## Setup (one time)
 
-Odds come from Polymarket's public APIs, so no API key or secret is needed.
-
-1. Create a **public** repo on GitHub (Actions minutes are free for public repos), then push this folder:
+1. Get an API key at [the-odds-api.com](https://the-odds-api.com). Each game uses 2 credits per attempt (spreads + totals), about 2,500 for a full season when the first attempt works, so the free 500/month tier won't last. The $30/month 20K plan covers it.
+2. Create a **public** repo on GitHub (Actions minutes are free for public repos), then push this folder:
    ```
    git remote add origin https://github.com/<you>/nba-q3-collector.git
    git push -u origin main
    ```
-2. On the **Actions** tab, open *Q3 checkpoint collector* and click **Run workflow** once to confirm it works.
+3. In the repo, go to **Settings → Secrets and variables → Actions → New repository secret**. Name it `ODDS_API_KEY` and paste the key.
+4. On the **Actions** tab, open *Q3 checkpoint collector* and click **Run workflow** once to confirm it works.
 
 ## How it runs
 
@@ -29,10 +29,6 @@ Odds come from Polymarket's public APIs, so no API key or secret is needed.
 - A game already in the CSV is never pulled again. Only one run can be active at a time.
 - If a game is first seen with under 4:00 left in Q3, or after it ends (for example, a delayed GitHub run), the row is still saved with pace and the score at 6:00, but `odds_status` is `missed` and no odds are pulled.
 
-## How the Polymarket line is chosen
-
-Polymarket lists a ladder of alternate spreads and totals for each game instead of one main line. At capture, the collector finds the game's event on the Gamma API by team nicknames and tip-off time. It reads the live best bid and ask for every spread and total from the CLOB order books, since Gamma's cached prices lag by several cents during games. The main line is the one whose midpoint is closest to 50/50, among books no wider than 10 cents when any qualify.
-
 ## Columns
 
 | Column | Meaning |
@@ -41,16 +37,15 @@ Polymarket lists a ladder of alternate spreads and totals for each game instead 
 | `away_score`, `home_score`, `margin` | Live score at capture; the final score for `F` rows |
 | `q3_poss_to_6`, `q3_pace_to_6` | Q3 possessions from 12:00 to 6:00, and that count ÷ 6 minutes |
 | `score_at_6`, `margin_at_6` | Score at the last play before 6:00, from play-by-play |
-| `spread_home`, `spread_away` (+ `_price`) | Live full-game main spread. Prices are American odds to buy each side at the best ask |
-| `total`, `over_price`, `under_price` | Live full-game main total, priced the same way |
-| `spread_home_mid`, `over_mid` | Bid-ask midpoint (0 to 1) for the home spread side and the over: Polymarket's implied probability |
-| `odds_source` | `polymarket`, or `pinnacle` for rows captured before the switch |
-| `polymarket_slug` | The Polymarket event, e.g. `nba-cle-okc-2026-11-04` |
-| `odds_status` | `ok`, `partial` (only one of spread/total found), `missed`, `no_event`, `no_lines`, or `error: ...`. Older Pinnacle rows may show `no_pinnacle` or `no_key` |
-| `odds_updated_utc` | Order book timestamp of the prices |
+| `spread_home`, `spread_away` (+ `_price`) | FanDuel live full-game spread, American odds |
+| `total`, `over_price`, `under_price` | FanDuel live full-game total |
+| `polymarket_slug`, `spread_home_mid`, `over_mid` | Polymarket rows only (2026-11-04 to 11-08): event slug and bid-ask midpoints. Blank otherwise |
+| `odds_source` | `fanduel` from 2026-11-09. Earlier rows are `pinnacle` (to 2026-11-04) or `polymarket` (2026-11-04 to 11-08) |
+| `odds_status` | `ok`, `partial` (only one of spread/total found), `missed`, `no_fanduel`, `no_event`, `no_lines`, `no_key`, or `error: ...`. Older rows may show `no_pinnacle` |
+| `odds_updated_utc` | When The Odds API last saw that FanDuel line |
 | `odds_attempts` | How many pulls it took (1 to 5); blank when `missed` |
 | `odds_clock` | Game clock when the odds were secured, e.g. `5:41` left in Q3 (`Q4 ...` if past Q3) |
-| `odds_credits_left` | Odds API credits left after the pull. Pinnacle rows only, blank for Polymarket |
+| `odds_credits_left` | Odds API credits left after the pull. Blank for Polymarket rows |
 | `score_end_q4` | Score (away-home) at the end of regulation |
 | `ot` | `yes` if the game went to overtime, otherwise `no` |
 | `final_score` | Final score (away-home), including OT |

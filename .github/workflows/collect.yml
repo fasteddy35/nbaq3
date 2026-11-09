@@ -34,4 +34,5 @@ jobs:
       - name: Collect
         run: python q3_collector.py
         env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           GIT_PUSH: '1'
