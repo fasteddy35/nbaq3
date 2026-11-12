@@ -4,7 +4,7 @@ For every NBA game, the first time the 3rd-quarter clock hits **6:00**, this rec
 
 - the live score and margin
 - **FanDuel's live spread and total** (with prices), via The Odds API, with up to 5 attempts per game
-- Q3 possessions and pace from 12:00 to 6:00, using the same rules as `pace_checkpoint.py`
+- Q3 possessions and pace from 12:00 to 6:00, using the same formula as `a.py`
 - once the game ends: the score at the end of Q4, the final score, and whether it went to OT
 
 It runs on GitHub Actions and adds each game as a row in [`data/q3_checkpoints.csv`](data/q3_checkpoints.csv).
@@ -35,7 +35,8 @@ It runs on GitHub Actions and adds each game as a row in [`data/q3_checkpoints.c
 |---|---|
 | `capture_period`, `capture_clock` | Game clock when the snapshot was taken; `F` means the game was already final |
 | `away_score`, `home_score`, `margin` | Live score at capture; the final score for `F` rows |
-| `q3_poss_to_6`, `q3_pace_to_6` | Q3 possessions from 12:00 to 6:00, and that count ÷ 6 minutes |
+| `q3_poss_to_6`, `q3_pace_to_6` | Q3 possessions from 12:00 to 6:00 (both teams), and that count ÷ 6 minutes |
+| `pace_formula` | How possessions were counted. `fga_trips_tov` (from 2026-11-11): FGA + 2- or 3-shot free throw trips + turnovers, no rebounds, and a shot, trip or turnover within 3 seconds after a live offensive rebound is the same possession. `rebounds` (earlier rows): made shots, last free throws, defensive rebounds and turnovers. The two are not comparable |
 | `score_at_6`, `margin_at_6` | Score at the last play before 6:00, from play-by-play |
 | `spread_home`, `spread_away` (+ `_price`) | FanDuel live full-game spread, American odds |
 | `total`, `over_price`, `under_price` | FanDuel live full-game total |

@@ -2,7 +2,7 @@
 
 The first time a game's 3rd-quarter clock reaches 6:00, this records the live
 score, FanDuel's live spread and total (up to 5 Odds API attempts per game),
-and pace_checkpoint.py's Q3 possessions/pace from 12:00 down to 6:00. Once the
+and Q3 possessions/pace from 12:00 down to 6:00 (a.py's formula). Once the
 game ends, the row also gets the score at the end of Q4, the final score and OT.
 
 Rows go to data/q3_checkpoints.csv. That file is also the record of which
@@ -38,7 +38,7 @@ SKIP_STATUSES     = {'STATUS_POSTPONED', 'STATUS_CANCELED', 'STATUS_SUSPENDED'}
 FIELDS = [
     'game_date', 'espn_id', 'away', 'home', 'tipoff_utc',
     'captured_utc', 'capture_period', 'capture_clock', 'away_score', 'home_score', 'margin',
-    'q3_poss_to_6', 'q3_pace_to_6', 'score_at_6', 'margin_at_6',
+    'q3_poss_to_6', 'q3_pace_to_6', 'pace_formula', 'score_at_6', 'margin_at_6',
     'odds_status', 'odds_updated_utc',
     'spread_home', 'spread_home_price', 'spread_away', 'spread_away_price',
     'total', 'over_price', 'under_price', 'odds_credits_left',
@@ -105,36 +105,59 @@ def clock_to_minutes(display):
         return None
 
 
-# ── PACE (same rules as pace_checkpoint.py, on ESPN plays) ──────
+# ── PACE (same formula as a.py, on ESPN plays) ──────────────────
+#
+# Possessions = FGA + free throw trips (2 or 3 shots) + turnovers, both teams combined.
+# - A 2- or 3-shot trip counts once, on its first free throw ('1 of 2' / '1 of 3').
+# - One-shot trips ('1 of 1': and-ones, technicals) don't count.
+# - Rebounds never count. After an offensive rebound off a missed shot or a missed final
+#   free throw, the next FGA, trip or turnover is the same possession (a putback) only if
+#   it comes within PUTBACK_SECONDS of game clock. Later ones count as a new possession.
+#   ESPN also logs an 'offensive rebound' after a missed first free throw of a trip; that
+#   is a dead-ball team rebound and changes nothing.
+# Rows saved before 2026-11-11 used the old rebound-based rules (pace_formula = 'rebounds').
 
-LAST_FT_PATTERNS = ['1 of 1', '2 of 2', '3 of 3', '2 of 3']
-
-
-def ends_possession(play):
-    ptype = play.get('type', {}).get('text', '').lower()
-    desc  = play.get('text', '')
-    if ptype.startswith('free throw'):
-        return any(p in desc for p in LAST_FT_PATTERNS)
-    if play.get('shootingPlay'):
-        return bool(play.get('scoringPlay'))
-    if 'rebound' in ptype:
-        return 'offensive' not in ptype
-    return 'turnover' in ptype or 'turnover' in desc.lower()
+PACE_FORMULA     = 'fga_trips_tov'
+PUTBACK_SECONDS  = 3
+TRIP_START_FTS   = ['1 of 2', '1 of 3']
+FINAL_FTS        = ['1 of 1', '2 of 2', '3 of 3']
 
 
 def pace_at_checkpoint(plays):
     """Q3 possessions from 12:00 down to the checkpoint, pace per minute, score there."""
     poss_count = 0
     score      = '--'
+    last_shot  = None        # (is_ft, desc, missed) of the most recent FGA or free throw
+    putback_by = None        # minutes-left a putback must come at or before
     for play in plays:
         if play.get('period', {}).get('number') != 3:
             continue
         mins_left = clock_to_minutes(play.get('clock', {}).get('displayValue', ''))
         if mins_left is not None and mins_left < CHECKPOINT_MINUTE:
             break
-        if ends_possession(play):
-            poss_count += 1
         score = f"{play.get('awayScore')}-{play.get('homeScore')}"
+
+        ptype  = play.get('type', {}).get('text', '').lower()
+        desc   = play.get('text', '')
+        is_ft  = ptype.startswith('free throw')
+        is_fga = bool(play.get('shootingPlay')) and not is_ft
+        missed = not play.get('scoringPlay')
+
+        if 'rebound' in ptype:
+            if 'offensive' in ptype and last_shot and mins_left is not None:
+                shot_is_ft, shot_desc, shot_missed = last_shot
+                if shot_missed and (not shot_is_ft or any(p in shot_desc for p in FINAL_FTS)):
+                    putback_by = mins_left - PUTBACK_SECONDS / 60
+            continue
+        if is_fga or is_ft:
+            last_shot = (is_ft, desc, missed)
+
+        turnover = 'turnover' in ptype or 'turnover' in desc.lower()
+        if is_fga or turnover or (is_ft and any(p in desc for p in TRIP_START_FTS)):
+            window, putback_by = putback_by, None     # only the first play after the rebound
+            if window is not None and mins_left is not None and mins_left >= window - 1e-9:
+                continue                               # putback: same possession
+            poss_count += 1
     return poss_count, round(poss_count / (12.0 - CHECKPOINT_MINUTE), 2), score
 
 
@@ -235,6 +258,8 @@ def read_rows():
     for row in rows.values():  # rows from before odds_source existed were all Pinnacle
         if row['odds_status'] == 'ok' and not row['odds_source']:
             row['odds_source'] = 'pinnacle'
+        if row['q3_poss_to_6'] != '' and not row['pace_formula']:  # saved before 2026-11-11
+            row['pace_formula'] = 'rebounds'
     return rows
 
 
@@ -357,7 +382,7 @@ def finalize(snap, game, force=False):
     odds   = future.result() if future else {'odds_status': 'missed'}
     snap   = {k: v for k, v in snap.items() if k != 'odds'}
     return {**dict.fromkeys(FIELDS, ''), **snap, **odds,
-            'q3_poss_to_6': poss, 'q3_pace_to_6': pace, 'score_at_6': score, 'margin_at_6': margin}
+            'q3_poss_to_6': poss, 'q3_pace_to_6': pace, 'pace_formula': PACE_FORMULA, 'score_at_6': score, 'margin_at_6': margin}
 
 
 def watching(game, now):
